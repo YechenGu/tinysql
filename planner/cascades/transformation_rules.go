@@ -194,6 +194,16 @@ func (r *PushSelDownIndexScan) OnTransform(old *memo.ExprIter) (newExprs []*memo
 		}
 	}
 	// TODO: `res` still has some unused fields: EqOrInCount, IsDNFCond.
+	if res.EqOrInCount > 0 && !res.IsDNFCond {
+		accesses, filters, newConditions, isNil :=
+			ranger.ExtractEqAndInCondition(is.SCtx(), conditions, is.IdxCols, is.IdxColLens)
+		if isNil {
+			return nil, true, true, nil
+		}
+		res.AccessConds = append(newConditions, accesses...)
+		res.RemainedConds = append(res.RemainedConds, filters...)
+	}
+
 	newIs := plannercore.LogicalIndexScan{
 		Source:         is.Source,
 		IsDoubleRead:   is.IsDoubleRead,
@@ -495,6 +505,61 @@ func NewRulePushSelDownAggregation() Transformation {
 // or just keep the selection unchanged.
 func (r *PushSelDownAggregation) OnTransform(old *memo.ExprIter) (newExprs []*memo.GroupExpr, eraseOld bool, eraseAll bool, err error) {
 	// TODO: implement the algo according to the header comment.
+	sel := old.GetExpr().ExprNode.(*plannercore.LogicalSelection)
+	agg := old.Children[0].GetExpr().ExprNode.(*plannercore.LogicalAggregation)
+
+	aggSchema := old.Children[0].Prop.Schema
+	var pushedExprs []expression.Expression
+	var remainedExprs []expression.Expression
+	exprsOriginal := make([]expression.Expression, 0, len(agg.AggFuncs))
+	for _, aggFunc := range agg.AggFuncs {
+		exprsOriginal = append(exprsOriginal, aggFunc.Args[0])
+	}
+	groupByColumns := expression.NewSchema(agg.GetGroupByCols()...)
+	for _, cond := range sel.Conditions {
+		switch cond.(type) {
+		case *expression.Constant:
+			pushedExprs = append(pushedExprs, cond)
+			remainedExprs = append(remainedExprs, cond)
+		case *expression.ScalarFunction:
+			extractedCols := expression.ExtractColumns(cond)
+			canPush := true
+			for _, col := range extractedCols {
+				if !groupByColumns.Contains(col) {
+					canPush = false
+					break
+				}
+			}
+			if canPush {
+				pushedExprs = append(pushedExprs, cond)
+			} else {
+				remainedExprs = append(remainedExprs, cond)
+			}
+		default:
+			remainedExprs = append(remainedExprs, cond)
+		}
+	}
+	if len(pushedExprs) == 0 {
+		return nil, false, false, nil
+	}
+	sctx := sel.SCtx()
+	childGroup := old.Children[0].GetExpr().Children[0]
+	pushedSel := plannercore.LogicalSelection{Conditions: pushedExprs}.Init(sctx)
+	pushedGroupExpr := memo.NewGroupExpr(pushedSel)
+	pushedGroupExpr.SetChildren(childGroup)
+	pushedGroup := memo.NewGroupWithSchema(pushedGroupExpr, childGroup.Prop.Schema)
+
+	aggGroupExpr := memo.NewGroupExpr(agg)
+	aggGroupExpr.SetChildren(pushedGroup)
+
+	if len(remainedExprs) == 0 {
+		return []*memo.GroupExpr{aggGroupExpr}, true, false, nil
+	}
+
+	aggGroup := memo.NewGroupWithSchema(aggGroupExpr, aggSchema)
+	remainedSel := plannercore.LogicalSelection{Conditions: remainedExprs}.Init(sctx)
+	remainedGroupExpr := memo.NewGroupExpr(remainedSel)
+	remainedGroupExpr.SetChildren(aggGroup)
 	return []*memo.GroupExpr{old.GetExpr()}, false, false, nil
 }
 
@@ -798,5 +863,31 @@ func (r *MergeAggregationProjection) Match(old *memo.ExprIter) bool {
 // It will transform `Aggregation->Projection->X` to `Aggregation->X`.
 func (r *MergeAggregationProjection) OnTransform(old *memo.ExprIter) (newExprs []*memo.GroupExpr, eraseOld bool, eraseAll bool, err error) {
 	// TODO: implement the body according to the header comment.
+	agg := old.GetExpr().ExprNode.(*plannercore.LogicalAggregation)
+	proj := old.Children[0].GetExpr().ExprNode.(*plannercore.LogicalProjection)
+	projSchema := old.Children[0].GetExpr().Schema()
+
+	var items []expression.Expression
+	for _, item := range agg.GroupByItems {
+		items = append(items, expression.ColumnSubstitute(item, projSchema, proj.Exprs))
+	}
+
+	newFuncs := make([]*aggregation.AggFuncDesc, len(agg.AggFuncs))
+	for i, aggFunc := range agg.AggFuncs {
+		newFuncs[i] = aggFunc.Clone()
+		var args []expression.Expression
+		for _, arg := range aggFunc.Args {
+			args = append(args, expression.ColumnSubstitute(arg, projSchema, proj.Exprs))
+		}
+		newFuncs[i].Args = args
+	}
+
+	newAgg := plannercore.LogicalAggregation{
+		GroupByItems: items,
+		AggFuncs:     newFuncs,
+	}.Init(agg.SCtx())
+
+	newAggExpr := memo.NewGroupExpr(newAgg)
+	newAggExpr.SetChildren(old.Children[0].GetExpr().Children...)
 	return []*memo.GroupExpr{old.GetExpr()}, false, false, nil
 }

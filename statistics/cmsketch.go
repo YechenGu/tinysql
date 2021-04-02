@@ -14,7 +14,9 @@
 package statistics
 
 import (
+	"github.com/cznic/sortutil"
 	"reflect"
+	"sort"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
@@ -50,6 +52,11 @@ func (c *CMSketch) InsertBytes(bytes []byte) {
 // insertBytesByCount adds the bytes value into the TopN (if value already in TopN) or CM Sketch by delta, this does not updates c.defaultValue.
 func (c *CMSketch) insertBytesByCount(bytes []byte, count uint64) {
 	// TODO: implement the insert method.
+	// use Count-Min method
+	for d := int32(0); d < c.depth; d++ {
+		w := murmur3.Sum32WithSeed(bytes, uint32(d)) % uint32(c.width)
+		c.table[d][w] += uint32(count)
+	}
 }
 
 func (c *CMSketch) queryValue(sc *stmtctx.StatementContext, val types.Datum) (uint64, error) {
@@ -68,7 +75,28 @@ func (c *CMSketch) QueryBytes(d []byte) uint64 {
 
 func (c *CMSketch) queryHashValue(h1, h2 uint64) uint64 {
 	// TODO: implement the query method.
-	return uint64(0)
+	// CM[i,j] - (N - CM[i, j]) / (w-1)
+	CM := make([]uint64, c.depth)
+	for d := uint64(0); d < uint64(c.depth); d++ {
+		w := (h1 + h2 * d) % uint64(c.width)
+		res := uint64(c.table[d][w])
+
+		N := uint64(0)
+
+		for i := uint64(0); i < uint64(c.width); i++ {
+			N += uint64(c.table[d][w])
+		}
+
+		noise := (N - res) / uint64(c.width-1)
+		if res < noise {
+			CM[d] = 0
+		} else {
+			CM[d] = res - noise
+		}
+	}
+	sort.Sort(sortutil.Uint64Slice(CM))
+
+	return (CM[(c.depth-1)/2] + CM[(c.depth)/2]) /2
 }
 
 // MergeCMSketch merges two CM Sketch.
