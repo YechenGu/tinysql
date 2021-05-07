@@ -98,7 +98,6 @@ func DecodeRecordKey(key kv.Key) (tableID int64, handle int64, err error) {
 		return 0,0,err
 	}
 	return tableID, handle, nil
-	return
 }
 
 // appendTableIndexPrefix appends table index prefix  "t[tableID]_i".
